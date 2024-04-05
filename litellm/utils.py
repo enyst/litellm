@@ -930,6 +930,8 @@ def print_verbose(
     log_level: Literal["DEBUG", "INFO"] = "DEBUG",
 ):
     try:
+        if litellm.set_verbose == False:
+            return
         if log_level == "DEBUG":
             verbose_logger.debug(print_statement)
         elif log_level == "INFO":
