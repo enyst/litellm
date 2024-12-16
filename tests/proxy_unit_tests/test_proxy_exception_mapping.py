@@ -316,3 +316,36 @@ def test_chat_completion_exception_azure_context_window(mock_acompletion, client
 
     except Exception as e:
         pytest.fail(f"LiteLLM Proxy test failed. Exception {str(e)}")
+
+
+@pytest.fixture
+def client_preserve_exceptions():
+    filepath = os.path.dirname(os.path.abspath(__file__))
+    config_fp = f"{filepath}/test_configs/test_preserve_exceptions.yaml"
+    asyncio.run(initialize(config=config_fp))
+    from litellm.proxy.proxy_server import app
+
+    return TestClient(app)
+
+
+def test_preserve_original_exceptions(client_preserve_exceptions):
+    """Test that when preserve_original_exceptions is True, original exceptions are returned"""
+    try:
+        # Your test data
+        test_data = {
+            "model": "gpt-3.5-turbo",
+            "messages": [
+                {"role": "user", "content": "hi"},
+            ],
+        }
+
+        # This should raise an AuthenticationError due to bad-key
+        with pytest.raises(litellm.AuthenticationError) as exc_info:
+            client_preserve_exceptions.post("/chat/completions", json=test_data)
+
+        # Verify it's the actual LiteLLM exception
+        assert isinstance(exc_info.value, litellm.AuthenticationError)
+        assert "AuthenticationError" in str(exc_info.value)
+
+    except Exception as e:
+        pytest.fail(f"LiteLLM Proxy test failed. Exception {str(e)}")
