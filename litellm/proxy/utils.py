@@ -2915,12 +2915,19 @@ def _get_docs_url() -> Optional[str]:
     return "/"
 
 
-def handle_exception_on_proxy(e: Exception) -> ProxyException:
+def handle_exception_on_proxy(e: Exception) -> Exception:
     """
-    Returns an Exception as ProxyException, this ensures all exceptions are OpenAI API compatible
+    By default, returns exceptions wrapped in ProxyException.
+    If general_settings.preserve_original_exceptions is True, returns the original exception.
     """
     from fastapi import status
+    from litellm.proxy.proxy_server import general_settings
 
+    # If preserve_original_exceptions is True, return the original exception
+    if getattr(general_settings, "preserve_original_exceptions", False):
+        return e
+
+    # Otherwise wrap in ProxyException as before
     if isinstance(e, HTTPException):
         return ProxyException(
             message=getattr(e, "detail", f"error({str(e)})"),
@@ -2931,7 +2938,7 @@ def handle_exception_on_proxy(e: Exception) -> ProxyException:
     elif isinstance(e, ProxyException):
         return e
     return ProxyException(
-        message="Internal Server Error, " + str(e),
+        message=str(e),
         type=ProxyErrorTypes.internal_server_error,
         param=getattr(e, "param", "None"),
         code=status.HTTP_500_INTERNAL_SERVER_ERROR,
