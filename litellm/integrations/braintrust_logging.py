@@ -4,7 +4,7 @@
 import copy
 import os
 from datetime import datetime
-from typing import Optional
+from typing import Dict, Optional
 
 import httpx
 from pydantic import BaseModel
@@ -49,6 +49,9 @@ class BraintrustLogger(CustomLogger):
             "Authorization": "Bearer " + self.api_key,
             "Content-Type": "application/json",
         }
+        self._project_id_cache: Dict[
+            str, str
+        ] = {}  # Cache mapping project names to IDs
 
     def validate_environment(self, api_key: Optional[str]):
         """
@@ -63,6 +66,47 @@ class BraintrustLogger(CustomLogger):
 
         if len(missing_keys) > 0:
             raise Exception("Missing keys={} in environment.".format(missing_keys))
+
+    def get_project_id_sync(self, project_name: str) -> str:
+        """
+        Get project ID from name, using cache if available.
+        If project doesn't exist, creates it.
+        """
+        if project_name in self._project_id_cache:
+            return self._project_id_cache[project_name]
+
+        try:
+            response = global_braintrust_sync_http_handler.post(
+                f"{self.api_base}/project",
+                headers=self.headers,
+                json={"name": project_name},
+            )
+            project_dict = response.json()
+            project_id = project_dict["id"]
+            self._project_id_cache[project_name] = project_id
+            return project_id
+        except httpx.HTTPStatusError as e:
+            raise Exception(f"Failed to register project: {e.response.text}")
+
+    async def get_project_id_async(self, project_name: str) -> str:
+        """
+        Async version of get_project_id_sync
+        """
+        if project_name in self._project_id_cache:
+            return self._project_id_cache[project_name]
+
+        try:
+            response = await global_braintrust_http_handler.post(
+                f"{self.api_base}/project/register",
+                headers=self.headers,
+                json={"name": project_name},
+            )
+            project_dict = response.json()
+            project_id = project_dict["id"]
+            self._project_id_cache[project_name] = project_id
+            return project_id
+        except httpx.HTTPStatusError as e:
+            raise Exception(f"Failed to register project: {e.response.text}")
 
     @staticmethod
     def add_metadata_from_header(litellm_params: dict, metadata: dict) -> dict:
@@ -125,14 +169,9 @@ class BraintrustLogger(CustomLogger):
         verbose_logger.debug("REACHES BRAINTRUST SUCCESS")
         try:
             litellm_call_id = kwargs.get("litellm_call_id")
-            project_id = kwargs.get("project_id", None)
-            if project_id is None:
-                if self.default_project_id is None:
-                    self.create_sync_default_project_and_experiment()
-                project_id = self.default_project_id
-
             prompt = {"messages": kwargs.get("messages")}
             output = None
+            choices = []
             if response_obj is not None and (
                 kwargs.get("call_type", None) == "embedding"
                 or isinstance(response_obj, litellm.EmbeddingResponse)
@@ -142,10 +181,12 @@ class BraintrustLogger(CustomLogger):
                 response_obj, litellm.ModelResponse
             ):
                 output = response_obj["choices"][0]["message"].json()
+                choices = response_obj["choices"]
             elif response_obj is not None and isinstance(
                 response_obj, litellm.TextCompletionResponse
             ):
                 output = response_obj.choices[0].text
+                choices = response_obj.choices
             elif response_obj is not None and isinstance(
                 response_obj, litellm.ImageResponse
             ):
@@ -174,10 +215,22 @@ class BraintrustLogger(CustomLogger):
                         new_metadata[key] = copy.deepcopy(value)
                 metadata = new_metadata
 
+            # Get project_id from metadata or create default if needed
+            project_id = metadata.get("project_id")
+            if project_id is None:
+                project_name = metadata.get("project_name")
+                project_id = (
+                    self.get_project_id_sync(project_name) if project_name else None
+                )
+
+            if project_id is None:
+                if self.default_project_id is None:
+                    self.create_sync_default_project_and_experiment()
+                project_id = self.default_project_id
+
             tags = []
             if isinstance(metadata, dict):
                 for key, value in metadata.items():
-
                     # generate langfuse tags - Default Tags sent to Langfuse from LiteLLM Proxy
                     if (
                         litellm.langfuse_default_tags is not None
@@ -210,15 +263,24 @@ class BraintrustLogger(CustomLogger):
                     "completion_tokens": usage_obj.completion_tokens,
                     "total_tokens": usage_obj.total_tokens,
                     "total_cost": cost,
+                    "time_to_first_token": end_time.timestamp()
+                    - start_time.timestamp(),
+                    "start": start_time.timestamp(),
+                    "end": end_time.timestamp(),
                 }
 
             request_data = {
                 "id": litellm_call_id,
-                "input": prompt,
-                "output": output,
+                "input": prompt["messages"],
                 "metadata": clean_metadata,
                 "tags": tags,
+                "span_attributes": {"name": "Chat Completion", "type": "llm"},
             }
+            if choices is not None:
+                request_data["output"] = [choice.dict() for choice in choices]
+            else:
+                request_data["output"] = output
+
             if metrics is not None:
                 request_data["metrics"] = metrics
 
@@ -242,14 +304,9 @@ class BraintrustLogger(CustomLogger):
         verbose_logger.debug("REACHES BRAINTRUST SUCCESS")
         try:
             litellm_call_id = kwargs.get("litellm_call_id")
-            project_id = kwargs.get("project_id", None)
-            if project_id is None:
-                if self.default_project_id is None:
-                    await self.create_default_project_and_experiment()
-                project_id = self.default_project_id
-
             prompt = {"messages": kwargs.get("messages")}
             output = None
+            choices = []
             if response_obj is not None and (
                 kwargs.get("call_type", None) == "embedding"
                 or isinstance(response_obj, litellm.EmbeddingResponse)
@@ -259,10 +316,12 @@ class BraintrustLogger(CustomLogger):
                 response_obj, litellm.ModelResponse
             ):
                 output = response_obj["choices"][0]["message"].json()
+                choices = response_obj["choices"]
             elif response_obj is not None and isinstance(
                 response_obj, litellm.TextCompletionResponse
             ):
                 output = response_obj.choices[0].text
+                choices = response_obj.choices
             elif response_obj is not None and isinstance(
                 response_obj, litellm.ImageResponse
             ):
@@ -291,12 +350,24 @@ class BraintrustLogger(CustomLogger):
                             value[k] = v.isoformat()
                     new_metadata[key] = value
 
-            metadata = new_metadata
+            # Get project_id from metadata or create default if needed
+            project_id = metadata.get("project_id")
+            if project_id is None:
+                project_name = metadata.get("project_name")
+                project_id = (
+                    await self.get_project_id_async(project_name)
+                    if project_name
+                    else None
+                )
+
+            if project_id is None:
+                if self.default_project_id is None:
+                    await self.create_default_project_and_experiment()
+                project_id = self.default_project_id
 
             tags = []
             if isinstance(metadata, dict):
                 for key, value in metadata.items():
-
                     # generate langfuse tags - Default Tags sent to Langfuse from LiteLLM Proxy
                     if (
                         litellm.langfuse_default_tags is not None
@@ -329,15 +400,37 @@ class BraintrustLogger(CustomLogger):
                     "completion_tokens": usage_obj.completion_tokens,
                     "total_tokens": usage_obj.total_tokens,
                     "total_cost": cost,
+                    "start": start_time.timestamp(),
+                    "end": end_time.timestamp(),
                 }
+
+                api_call_start_time = kwargs.get("api_call_start_time")
+                completion_start_time = kwargs.get("completion_start_time")
+
+                if (
+                    api_call_start_time is not None
+                    and completion_start_time is not None
+                ):
+                    metrics["time_to_first_token"] = (
+                        completion_start_time.timestamp()
+                        - api_call_start_time.timestamp()
+                    )
 
             request_data = {
                 "id": litellm_call_id,
-                "input": prompt,
+                "input": prompt["messages"],
                 "output": output,
                 "metadata": clean_metadata,
                 "tags": tags,
+                "span_attributes": {"name": "Chat Completion", "type": "llm"},
             }
+            if choices is not None:
+                request_data["output"] = [choice.dict() for choice in choices]
+            else:
+                request_data["output"] = output
+
+            if metrics is not None:
+                request_data["metrics"] = metrics
 
             if metrics is not None:
                 request_data["metrics"] = metrics

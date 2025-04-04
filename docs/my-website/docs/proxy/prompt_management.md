@@ -4,11 +4,18 @@ import TabItem from '@theme/TabItem';
 
 # Prompt Management
 
+:::info
+
+This feature is currently in beta, and might change unexpectedly. We expect this to be more stable by next month (February 2025).
+ 
+:::
+
 Run experiments or change the specific model (e.g. from gpt-4o to gpt4o-mini finetune) from your prompt management tool (e.g. Langfuse) instead of making changes in the application. 
 
-Supported Integrations:
-- [Langfuse](https://langfuse.com/docs/prompts/get-started)
-- [Humanloop](../observability/humanloop)
+| Supported Integrations | Link |
+|------------------------|------|
+| Langfuse               | [Get Started](https://langfuse.com/docs/prompts/get-started) |
+| Humanloop              | [Get Started](../observability/humanloop) |
 
 ## Quick Start
 
@@ -43,10 +50,14 @@ resp = litellm.completion(
 
 ```yaml
 model_list:
-  - model_name: gpt-3.5-turbo
+  - model_name: my-langfuse-model
     litellm_params:
-      model: langfuse/gpt-3.5-turbo
+      model: langfuse/openai-model
       prompt_id: "<langfuse_prompt_id>"
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: openai-model
+    litellm_params:
+      model: openai/gpt-3.5-turbo
       api_key: os.environ/OPENAI_API_KEY
 ```
 
@@ -66,7 +77,7 @@ curl -L -X POST 'http://0.0.0.0:4000/v1/chat/completions' \
 -H 'Content-Type: application/json' \
 -H 'Authorization: Bearer sk-1234' \
 -d '{
-    "model": "gpt-3.5-turbo",
+    "model": "my-langfuse-model",
     "messages": [
         {
             "role": "user",

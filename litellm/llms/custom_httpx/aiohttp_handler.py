@@ -1,20 +1,24 @@
-import json
-from typing import TYPE_CHECKING, Any, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple, Union, cast
 
-import aiohttp  # Add this import
+import aiohttp
 import httpx  # type: ignore
+from aiohttp import ClientSession, FormData
 
 import litellm
 import litellm.litellm_core_utils
 import litellm.types
 import litellm.types.utils
 from litellm.llms.base_llm.chat.transformation import BaseConfig
+from litellm.llms.base_llm.image_variations.transformation import (
+    BaseImageVariationConfig,
+)
 from litellm.llms.custom_httpx.http_handler import (
     AsyncHTTPHandler,
     HTTPHandler,
     _get_httpx_client,
-    get_async_httpx_client,
 )
+from litellm.types.llms.openai import FileTypes
+from litellm.types.utils import HttpHandlerRequestFields, ImageResponse, LlmProviders
 from litellm.utils import CustomStreamWrapper, ModelResponse, ProviderConfigManager
 
 if TYPE_CHECKING:
@@ -28,19 +32,31 @@ DEFAULT_TIMEOUT = 600
 
 
 class BaseLLMAIOHTTPHandler:
-
     def __init__(self):
         self.client_session: Optional[aiohttp.ClientSession] = None
 
+    def _get_async_client_session(
+        self, dynamic_client_session: Optional[ClientSession] = None
+    ) -> ClientSession:
+        if dynamic_client_session:
+            return dynamic_client_session
+        elif self.client_session:
+            return self.client_session
+        else:
+            # init client session, and then return new session
+            self.client_session = aiohttp.ClientSession()
+            return self.client_session
+
     async def _make_common_async_call(
         self,
-        async_httpx_client: AsyncHTTPHandler,
+        async_client_session: Optional[ClientSession],
         provider_config: BaseConfig,
         api_base: str,
         headers: dict,
-        data: dict,
+        data: Optional[dict],
         timeout: Union[float, httpx.Timeout],
         litellm_params: dict,
+        form_data: Optional[FormData] = None,
         stream: bool = False,
     ) -> aiohttp.ClientResponse:
         """Common implementation across stream + non-stream calls. Meant to ensure consistent error-handling."""
@@ -49,19 +65,22 @@ class BaseLLMAIOHTTPHandler:
         )
 
         response: Optional[aiohttp.ClientResponse] = None
-        if self.client_session is None:
-            self.client_session = aiohttp.ClientSession()
+        async_client_session = self._get_async_client_session(
+            dynamic_client_session=async_client_session
+        )
 
         for i in range(max(max_retry_on_unprocessable_entity_error, 1)):
             try:
-                response = await self.client_session.post(
+                response = await async_client_session.post(
                     url=api_base,
                     headers=headers,
                     json=data,
+                    data=form_data,
                 )
                 if not response.ok:
                     response.raise_for_status()
             except aiohttp.ClientResponseError as e:
+                setattr(e, "text", e.message)
                 raise self._handle_error(e=e, provider_config=provider_config)
             except Exception as e:
                 raise self._handle_error(e=e, provider_config=provider_config)
@@ -86,8 +105,10 @@ class BaseLLMAIOHTTPHandler:
         timeout: Union[float, httpx.Timeout],
         litellm_params: dict,
         stream: bool = False,
+        files: Optional[dict] = None,
+        content: Any = None,
+        params: Optional[dict] = None,
     ) -> httpx.Response:
-
         max_retry_on_unprocessable_entity_error = (
             provider_config.max_retry_on_unprocessable_entity_error
         )
@@ -99,9 +120,12 @@ class BaseLLMAIOHTTPHandler:
                 response = sync_httpx_client.post(
                     url=api_base,
                     headers=headers,
-                    data=json.dumps(data),
+                    data=data,  # do not json dump the data here. let the individual endpoint handle this.
                     timeout=timeout,
                     stream=stream,
+                    files=files,
+                    content=content,
+                    params=params,
                 )
             except httpx.HTTPStatusError as e:
                 hit_max_retry = i + 1 == max_retry_on_unprocessable_entity_error
@@ -146,17 +170,10 @@ class BaseLLMAIOHTTPHandler:
         litellm_params: dict,
         encoding: Any,
         api_key: Optional[str] = None,
-        client: Optional[AsyncHTTPHandler] = None,
+        client: Optional[ClientSession] = None,
     ):
-        if client is None:
-            async_httpx_client = get_async_httpx_client(
-                llm_provider=litellm.LlmProviders(custom_llm_provider)
-            )
-        else:
-            async_httpx_client = client
-
         _response = await self._make_common_async_call(
-            async_httpx_client=async_httpx_client,
+            async_client_session=client,
             provider_config=provider_config,
             api_base=api_base,
             headers=headers,
@@ -165,9 +182,19 @@ class BaseLLMAIOHTTPHandler:
             litellm_params=litellm_params,
             stream=False,
         )
-        _json_response = await _response.json()
-
-        return _json_response
+        _transformed_response = await provider_config.transform_response(  # type: ignore
+            model=model,
+            raw_response=_response,  # type: ignore
+            model_response=model_response,
+            logging_obj=logging_obj,
+            api_key=api_key,
+            request_data=data,
+            messages=messages,
+            optional_params=optional_params,
+            litellm_params=litellm_params,
+            encoding=encoding,
+        )
+        return _transformed_response
 
     def completion(
         self,
@@ -186,7 +213,7 @@ class BaseLLMAIOHTTPHandler:
         fake_stream: bool = False,
         api_key: Optional[str] = None,
         headers: Optional[dict] = {},
-        client: Optional[Union[HTTPHandler, AsyncHTTPHandler]] = None,
+        client: Optional[Union[HTTPHandler, AsyncHTTPHandler, ClientSession]] = None,
     ):
         provider_config = ProviderConfigManager.get_provider_chat_config(
             model=model, provider=litellm.LlmProviders(custom_llm_provider)
@@ -203,8 +230,10 @@ class BaseLLMAIOHTTPHandler:
 
         api_base = provider_config.get_complete_url(
             api_base=api_base,
+            api_key=api_key,
             model=model,
             optional_params=optional_params,
+            litellm_params=litellm_params,
             stream=stream,
         )
 
@@ -245,7 +274,7 @@ class BaseLLMAIOHTTPHandler:
                 encoding=encoding,
                 client=(
                     client
-                    if client is not None and isinstance(client, AsyncHTTPHandler)
+                    if client is not None and isinstance(client, ClientSession)
                     else None
                 ),
             )
@@ -287,9 +316,9 @@ class BaseLLMAIOHTTPHandler:
             provider_config=provider_config,
             api_base=api_base,
             headers=headers,
-            data=data,
             timeout=timeout,
             litellm_params=litellm_params,
+            data=data,
         )
         return provider_config.transform_response(
             model=model,
@@ -355,6 +384,195 @@ class BaseLLMAIOHTTPHandler:
         )
 
         return completion_stream, dict(response.headers)
+
+    async def async_image_variations(
+        self,
+        client: Optional[ClientSession],
+        provider_config: BaseImageVariationConfig,
+        api_base: str,
+        headers: dict,
+        data: HttpHandlerRequestFields,
+        timeout: float,
+        litellm_params: dict,
+        model_response: ImageResponse,
+        logging_obj: LiteLLMLoggingObj,
+        api_key: str,
+        model: Optional[str],
+        image: FileTypes,
+        optional_params: dict,
+    ) -> ImageResponse:
+        # create aiohttp form data if files in data
+        form_data: Optional[FormData] = None
+        if "files" in data and "data" in data:
+            form_data = FormData()
+            for k, v in data["files"].items():
+                form_data.add_field(k, v[1], filename=v[0], content_type=v[2])
+
+            for key, value in data["data"].items():
+                form_data.add_field(key, value)
+
+        _response = await self._make_common_async_call(
+            async_client_session=client,
+            provider_config=provider_config,
+            api_base=api_base,
+            headers=headers,
+            data=None if form_data is not None else cast(dict, data),
+            form_data=form_data,
+            timeout=timeout,
+            litellm_params=litellm_params,
+            stream=False,
+        )
+
+        ## LOGGING
+        logging_obj.post_call(
+            api_key=api_key,
+            original_response=_response.text,
+            additional_args={
+                "headers": headers,
+                "api_base": api_base,
+            },
+        )
+
+        ## RESPONSE OBJECT
+        return await provider_config.async_transform_response_image_variation(
+            model=model,
+            model_response=model_response,
+            raw_response=_response,
+            logging_obj=logging_obj,
+            request_data=cast(dict, data),
+            image=image,
+            optional_params=optional_params,
+            litellm_params=litellm_params,
+            encoding=None,
+            api_key=api_key,
+        )
+
+    def image_variations(
+        self,
+        model_response: ImageResponse,
+        api_key: str,
+        model: Optional[str],
+        image: FileTypes,
+        timeout: float,
+        custom_llm_provider: str,
+        logging_obj: LiteLLMLoggingObj,
+        optional_params: dict,
+        litellm_params: dict,
+        print_verbose: Optional[Callable] = None,
+        api_base: Optional[str] = None,
+        aimage_variation: bool = False,
+        logger_fn=None,
+        client=None,
+        organization: Optional[str] = None,
+        headers: Optional[dict] = None,
+    ) -> ImageResponse:
+        if model is None:
+            raise ValueError("model is required for non-openai image variations")
+
+        provider_config = ProviderConfigManager.get_provider_image_variation_config(
+            model=model,  # openai defaults to dall-e-2
+            provider=LlmProviders(custom_llm_provider),
+        )
+
+        if provider_config is None:
+            raise ValueError(
+                f"image variation provider not found: {custom_llm_provider}."
+            )
+
+        api_base = provider_config.get_complete_url(
+            api_base=api_base,
+            api_key=api_key,
+            model=model,
+            optional_params=optional_params,
+            litellm_params=litellm_params,
+            stream=False,
+        )
+
+        headers = provider_config.validate_environment(
+            api_key=api_key,
+            headers=headers or {},
+            model=model,
+            messages=[{"role": "user", "content": "test"}],
+            optional_params=optional_params,
+            api_base=api_base,
+        )
+
+        data = provider_config.transform_request_image_variation(
+            model=model,
+            image=image,
+            optional_params=optional_params,
+            headers=headers,
+        )
+
+        ## LOGGING
+        logging_obj.pre_call(
+            input="",
+            api_key=api_key,
+            additional_args={
+                "headers": headers,
+                "api_base": api_base,
+                "complete_input_dict": data.copy(),
+            },
+        )
+
+        if litellm_params.get("async_call", False):
+            return self.async_image_variations(
+                api_base=api_base,
+                data=data,
+                headers=headers,
+                model_response=model_response,
+                logging_obj=logging_obj,
+                model=model,
+                timeout=timeout,
+                client=client,
+                optional_params=optional_params,
+                litellm_params=litellm_params,
+                image=image,
+                provider_config=provider_config,
+            )  # type: ignore
+
+        if client is None or not isinstance(client, HTTPHandler):
+            sync_httpx_client = _get_httpx_client()
+        else:
+            sync_httpx_client = client
+
+        response = self._make_common_sync_call(
+            sync_httpx_client=sync_httpx_client,
+            provider_config=provider_config,
+            api_base=api_base,
+            headers=headers,
+            timeout=timeout,
+            litellm_params=litellm_params,
+            stream=False,
+            data=data.get("data") or {},
+            files=data.get("files"),
+            content=data.get("content"),
+            params=data.get("params"),
+        )
+
+        ## LOGGING
+        logging_obj.post_call(
+            api_key=api_key,
+            original_response=response.text,
+            additional_args={
+                "headers": headers,
+                "api_base": api_base,
+            },
+        )
+
+        ## RESPONSE OBJECT
+        return provider_config.transform_response_image_variation(
+            model=model,
+            model_response=model_response,
+            raw_response=response,
+            logging_obj=logging_obj,
+            request_data=cast(dict, data),
+            image=image,
+            optional_params=optional_params,
+            litellm_params=litellm_params,
+            encoding=None,
+            api_key=api_key,
+        )
 
     def _handle_error(self, e: Exception, provider_config: BaseConfig):
         status_code = getattr(e, "status_code", 500)

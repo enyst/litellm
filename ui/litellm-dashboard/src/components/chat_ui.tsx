@@ -35,6 +35,7 @@ interface ChatUIProps {
   token: string | null;
   userRole: string | null;
   userID: string | null;
+  disabledPersonalKeyCreation: boolean;
 }
 
 async function generateModelResponse(
@@ -81,28 +82,38 @@ const ChatUI: React.FC<ChatUIProps> = ({
   token,
   userRole,
   userID,
+  disabledPersonalKeyCreation,
 }) => {
-  const [apiKeySource, setApiKeySource] = useState<'session' | 'custom'>('session');
+  const [apiKeySource, setApiKeySource] = useState<'session' | 'custom'>(
+    disabledPersonalKeyCreation ? 'custom' : 'session'
+  );
   const [apiKey, setApiKey] = useState("");
   const [inputMessage, setInputMessage] = useState("");
   const [chatHistory, setChatHistory] = useState<{ role: string; content: string; model?: string }[]>([]);
   const [selectedModel, setSelectedModel] = useState<string | undefined>(
     undefined
   );
+  const [showCustomModelInput, setShowCustomModelInput] = useState<boolean>(false);
   const [modelInfo, setModelInfo] = useState<any[]>([]);
+  const customModelTimeout = useRef<NodeJS.Timeout | null>(null);
 
   const chatEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    if (!accessToken || !token || !userRole || !userID) {
+    let useApiKey = apiKeySource === 'session' ? accessToken : apiKey;
+    console.log("useApiKey:", useApiKey);
+    if (!useApiKey || !token || !userRole || !userID) {
+      console.log("useApiKey or token or userRole or userID is missing = ", useApiKey, token, userRole, userID);
       return;
     }
+
+    
 
     // Fetch model info and set the default selected model
     const fetchModelInfo = async () => {
       try {
         const fetchedAvailableModels = await modelAvailableCall(
-          accessToken,
+          useApiKey ?? '', // Use empty string if useApiKey is null,
           userID,
           userRole
         );
@@ -135,13 +146,19 @@ const ChatUI: React.FC<ChatUIProps> = ({
     };
   
     fetchModelInfo();
-  }, [accessToken, userID, userRole]);
+  }, [accessToken, userID, userRole, apiKeySource, apiKey]);
   
 
   useEffect(() => {
     // Scroll to the bottom of the chat whenever chatHistory updates
     if (chatEndRef.current) {
-      chatEndRef.current.scrollIntoView({ behavior: "smooth" });
+      // Add a small delay to ensure content is rendered
+      setTimeout(() => {
+        chatEndRef.current?.scrollIntoView({ 
+          behavior: "smooth",
+          block: "end" // Keep the scroll position at the end
+        });
+      }, 100);
     }
   }, [chatHistory]);
 
@@ -180,17 +197,19 @@ const ChatUI: React.FC<ChatUIProps> = ({
       return;
     }
 
-
+    // Create message object without model field for API call
     const newUserMessage = { role: "user", content: inputMessage };
-
-    const updatedChatHistory = [...chatHistory, newUserMessage];
-
-    setChatHistory(updatedChatHistory);
+    
+    // Create chat history for API call - strip out model field
+    const apiChatHistory = [...chatHistory.map(({ role, content }) => ({ role, content })), newUserMessage];
+    
+    // Update UI with full message object (including model field for display)
+    setChatHistory([...chatHistory, newUserMessage]);
 
     try {
       if (selectedModel) {
         await generateModelResponse(
-          updatedChatHistory,
+          apiChatHistory,
           (chunk, model) => updateUI("assistant", chunk, model),
           selectedModel,
           effectiveApiKey
@@ -222,6 +241,7 @@ const ChatUI: React.FC<ChatUIProps> = ({
   const onChange = (value: string) => {
     console.log(`selected ${value}`);
     setSelectedModel(value);
+    setShowCustomModelInput(value === 'custom');
   };
 
   return (
@@ -240,6 +260,7 @@ const ChatUI: React.FC<ChatUIProps> = ({
                     <Col>
                       <Text>API Key Source</Text>
                       <Select
+                        disabled={disabledPersonalKeyCreation}
                         defaultValue="session"
                         style={{ width: "100%" }}
                         onChange={(value) => setApiKeySource(value as "session" | "custom")}
@@ -263,10 +284,29 @@ const ChatUI: React.FC<ChatUIProps> = ({
                       <Select
                         placeholder="Select a Model"
                         onChange={onChange}
-                        options={modelInfo}
+                        options={[
+                          ...modelInfo,
+                          { value: 'custom', label: 'Enter custom model' }
+                        ]}
                         style={{ width: "350px" }}
                         showSearch={true}
                       />
+                      {showCustomModelInput && (
+                        <TextInput
+                          className="mt-2"
+                          placeholder="Enter custom model name"
+                          onValueChange={(value) => {
+                            // Using setTimeout to create a simple debounce effect
+                            if (customModelTimeout.current) {
+                              clearTimeout(customModelTimeout.current);
+                            }
+                            
+                            customModelTimeout.current = setTimeout(() => {
+                              setSelectedModel(value);
+                            }, 500); // 500ms delay after typing stops
+                          }}
+                        />
+                      )}
                     </Col>
                   </Grid>
 
@@ -354,7 +394,7 @@ const ChatUI: React.FC<ChatUIProps> = ({
                     ))}
                     <TableRow>
                       <TableCell>
-                        <div ref={chatEndRef} />
+                        <div ref={chatEndRef} style={{ height: "1px" }} />
                       </TableCell>
                     </TableRow>
                   </TableBody>

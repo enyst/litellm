@@ -5,7 +5,7 @@ import pytest
 
 sys.path.insert(
     0, os.path.abspath("../..")
-)  # Adds the parent directory to the system path
+)  # Adds the parent directory to the system paths
 
 from base_llm_unit_tests import BaseLLMChatTest
 from litellm.llms.vertex_ai.context_caching.transformation import (
@@ -15,7 +15,7 @@ from litellm.llms.vertex_ai.context_caching.transformation import (
 
 class TestGoogleAIStudioGemini(BaseLLMChatTest):
     def get_base_completion_call_args(self) -> dict:
-        return {"model": "gemini/gemini-1.5-flash-002"}
+        return {"model": "gemini/gemini-2.0-flash"}
 
     def test_tool_call_no_arguments(self, tool_call_no_arguments):
         """Test that tool calls with no arguments is translated correctly. Relevant issue: https://github.com/BerriAI/litellm/issues/6833"""
